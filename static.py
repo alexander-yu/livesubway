@@ -9,8 +9,6 @@ from datetime import date
 import simplejson as json
 import transitfeed
 
-# TODO: Move this to a database, or make it more efficient in general
-
 JSON_DIR = "static/json/"
 PICKLE_DIR = ".cache/"
 STATIC_TRANSIT_DIR = "static_transit/"
@@ -20,10 +18,9 @@ if not os.path.isdir(JSON_DIR):
 if not os.path.isdir(PICKLE_DIR):
     os.makedirs(PICKLE_DIR)
 
+StopID = namedtuple('StopID', ['route', 'stop_id'])
 Segment = namedtuple('Segment', ['start', 'end'])
 Edge = namedtuple('Edge', ['shape_id', 'start_index', 'end_index'])
-StopID = namedtuple('StopID',
-                    ['route', 'stop_id'])
 
 
 class Coordinates(namedtuple('Coordinates', ['lon', 'lat'])):
@@ -94,6 +91,32 @@ SECOND_AVE_PATHS = set(["N..N63R", "N..N67R", "N..S16R", "Q..N16R", "Q..N19R",
                         "Q..S16R", "Q..S19R"])
 
 
+def get_service_code(trip):
+    """ Returns corresponding service code of a trip.
+
+    Arguments
+    ---------
+    trip: transit_realtime.TripDescriptor
+        GTFS realtime TripDescriptor object (protobuf)
+
+    Returns
+    -------
+    str
+        service code of trip
+    """
+    start_date = trip.start_date
+    year, month, day = int(start_date[:4]), int(start_date[4:6]), \
+        int(start_date[6:])
+    day_of_week = date(year, month, day).isoweekday()
+
+    if day_of_week <= 5:
+        return WEEKDAY_SERVICE_CODE
+    elif day_of_week == 6:
+        return SAT_SERVICE_CODE
+    else:
+        return SUN_SERVICE_CODE
+
+
 class Stop:
     """ Stop class.
 
@@ -103,32 +126,198 @@ class Stop:
     """
     def __init__(self):
         """ Constructor. """
+        self.trip_origin_time_pairs = {}
         self.trip_paths_by_prev_stop = {}
         self.prev_stops_by_stop_sequence = {}
         self.prev_stops = set()
+        self.trip_times_by_stop_sequence = {}
+        self.trip_times_by_prev_stop = {}
+        self.trip_times = set()
 
-    def add_prev_stop(self, stop_sequence, prev_stop, trip_path):
+    def add_prev_stop(self, stop_sequence, prev_stop_id, trip_path):
         """ Adds a previous stop possibility along a trip path.
 
         Arguments
         ---------
         stop_sequence: int
             Stop sequence of stop along a trip path
-        prev_stop: str
+        prev_stop_id: str
             Stop ID of preceding stop along a trip path
         trip_path: str
             Trip path ID containing stop
         """
-        if prev_stop not in self.trip_paths_by_prev_stop:
-            self.prev_stops.add(prev_stop)
-            self.trip_paths_by_prev_stop[prev_stop] = set([trip_path])
+        if prev_stop_id not in self.trip_paths_by_prev_stop:
+            self.prev_stops.add(prev_stop_id)
+            self.trip_paths_by_prev_stop[prev_stop_id] = set([trip_path])
         else:
-            self.trip_paths_by_prev_stop[prev_stop].add(trip_path)
+            self.trip_paths_by_prev_stop[prev_stop_id].add(trip_path)
 
         if stop_sequence not in self.prev_stops_by_stop_sequence:
-            self.prev_stops_by_stop_sequence[stop_sequence] = set([prev_stop])
+            self.prev_stops_by_stop_sequence[stop_sequence] = \
+                set([prev_stop_id])
         else:
-            self.prev_stops_by_stop_sequence[stop_sequence].add(prev_stop)
+            self.prev_stops_by_stop_sequence[stop_sequence].add(prev_stop_id)
+
+    def add_trip_time(self, stop_sequence, prev_stop_id, trip_id, interval):
+        """ Adds a trip time from a previous stop for a particular trip.
+
+        In particular, for a particular trip and the corresponding previous
+        stop on that trip, this stores the number of seconds it is estimated to
+        take to reach this particular stop from the previous stop.
+
+        Arguments
+        ---------
+        stop_sequence: int
+            Stop sequence of stop along a trip path
+        prev_stop_id: str
+            Stop ID of previous stop
+        trip_id: str
+            Trip ID of trip
+        interval: int
+            Number of seconds estimated to arrive from previous stop
+        """
+        service_id, origin_time = trip_id.split("_")[:2]
+        service_code = service_id[-3:]
+
+        if prev_stop_id not in self.trip_times_by_stop_sequence:
+            self.trip_times_by_stop_sequence[prev_stop_id] = {}
+        if stop_sequence not in self.trip_times_by_stop_sequence[prev_stop_id]:
+            self.trip_times_by_stop_sequence[prev_stop_id][stop_sequence] = \
+                set()
+        self.trip_times_by_stop_sequence[prev_stop_id][stop_sequence] \
+            .add(interval)
+
+        if prev_stop_id not in self.trip_origin_time_pairs:
+            self.trip_origin_time_pairs[prev_stop_id] = {}
+        if service_code not in self.trip_origin_time_pairs[prev_stop_id]:
+            self.trip_origin_time_pairs[prev_stop_id][service_code] = []
+        self.trip_origin_time_pairs[prev_stop_id][service_code] \
+            .append((origin_time, interval))
+
+        if prev_stop_id not in self.trip_times_by_prev_stop:
+            self.trip_times_by_prev_stop[prev_stop_id] = set()
+        self.trip_times_by_prev_stop[prev_stop_id].add(interval)
+
+        self.trip_times.add(interval)
+
+    def sort_trip_times(self):
+        """ Sorts trip times by origin time of trip. """
+        for prev_stop_id in self.trip_origin_time_pairs:
+            for service_code in self.trip_origin_time_pairs[prev_stop_id]:
+                trip_times = \
+                    self.trip_origin_time_pairs[prev_stop_id][service_code]
+                trip_times.sort(key=lambda x: int(x[0]))
+
+                # Split sorted list by origin times and intervals, since bisect
+                # can't operate on a key parameter; we need bisect to do
+                # efficient search by origin time.
+                sorted_origin_times, sorted_intervals = zip(*trip_times)
+                self.trip_origin_time_pairs[prev_stop_id][service_code] = {
+                    "origin_times": sorted_origin_times,
+                    "intervals": sorted_intervals
+                }
+
+    def _get_trip_time_by_origin_time(self, prev_stop_id, trip):
+        """ Returns a possible number of seconds for a given trip
+        to travel to this stop from a previous stop.
+
+        Given the stop id of the previous stop and the trip's service code and
+        origin time, this method then attempts to find a corresponding trip
+        in the static data that matches, or at least as closely
+        as possible in terms of origin time. The rationale for this
+        is based off of the assumption that the corresponding train
+        on the same route and day is most likely going to match with
+        the closest scheduled train on that route and day.
+
+        There is a possibility of multiple intervals for
+        the given information (as there may be multiple trips
+        on the same day and route starting at the same time),
+        and currently there is no real tiebreaker method, other
+        than the leftmost tied element.
+
+        One can use future stops to match with possible trips
+        or partial string matching in case an actual trip path ID
+        is given at a certain point, but not entirely sure if the
+        effort is worth it.
+
+        Arguments
+        ---------
+        prev_stop_id: str
+            Stop ID of previous stop
+        trip: transit_realtime.TripDescriptor
+            GTFS realtime TripDescriptor object (protobuf)
+
+        Returns
+        -------
+        int
+            Estimated seconds of travel from previous stop
+        """
+        service_code = get_service_code(trip)
+        origin_time = trip.trip_id.split("_")[0]
+        sorted_interval_pairs = \
+            self.trip_origin_time_pairs[prev_stop_id][service_code]
+        sorted_origin_times = sorted_interval_pairs["origin_times"]
+        sorted_intervals = sorted_interval_pairs["intervals"]
+
+        # We do this in case the origin time of the vehicle is later or
+        # earlier than all stored origin times for a particular stop
+        # sequence/route/service code. Instead of cycling around, we simply
+        # let left = right in these edge cases, as otherwise we would have
+        # to take into account the next day, possibly a different service
+        # code, but this then contradicts the specified start date of the
+        # vehicle.
+        right = min(
+            bisect_left(sorted_origin_times, origin_time),
+            len(sorted_origin_times) - 1
+        )
+        left = max(0, right - 1)
+
+        closest_index = min([
+            (abs(int(origin_time) -
+                 int(sorted_origin_times[candidate])),
+                candidate)
+            for candidate in [left, right]
+        ])[1]
+
+        return sorted_intervals[closest_index]
+
+    def get_trip_time(self, prev_stop_id, trip, stop_sequence):
+        """ Returns a possible interval of time to reach this
+        stop from a previous stop on a trip.
+
+        Arguments
+        ---------
+        prev_stop_id: str
+            Stop ID of previous stop
+        trip: transit_realtime.TripDescriptor
+            GTFS realtime TripDescriptor object (protobuf)
+        stop_sequence: int
+            Stop sequence of current stop on trip
+
+        Returns
+        -------
+        int
+            Estimated seconds of travel from previous stop
+        """
+        # Check if there is a unique time among all stop sequences
+        # and previous stops
+        if len(self.trip_times) == 1:
+            return next(iter(self.trip_times))
+        # Check if there is a unique time among all stop sequences for this
+        # previous stop
+        elif len(self.trip_times_by_prev_stop[prev_stop_id]) == 1:
+            return next(iter(self.trip_times_by_prev_stop[prev_stop_id]))
+        else:
+            # If there is a unique time corresponding also
+            # to the stop sequence number, return that
+            if stop_sequence in self.trip_times_by_stop_sequence[prev_stop_id]:
+                trip_times = self \
+                    .trip_times_by_stop_sequence[prev_stop_id][stop_sequence]
+                if len(trip_times) == 1:
+                    return next(iter(trip_times))
+
+            # Otherwise, attempt a guess by origin time
+            return self._get_trip_time_by_origin_time(prev_stop_id, trip)
 
 
 class PrevStops:
@@ -139,6 +328,7 @@ class PrevStops:
     This information is needed in order to render the duration of the path
     of the subway car.
     """
+
     def __init__(self, schedule):
         """ Constructor.
 
@@ -147,43 +337,15 @@ class PrevStops:
         schedule: transitfeed.Schedule
             Schedule object
         """
-        self._all_prev_stops = PrevStops._get_all_prev_stops(schedule)
+        self._stops = PrevStops._get_stops(schedule)
         self._ambiguous_trips = \
-            PrevStops._get_ambiguous_trip_paths(self._all_prev_stops)
+            PrevStops._get_ambiguous_trip_paths(self._stops)
         self._ambiguous_stop_sequences = \
             PrevStops._get_ambiguous_stop_sequences(self._ambiguous_trips,
                                                     schedule)
 
     @staticmethod
-    def _get_service_code(trip):
-        """ Returns corresponding service code of a trip.
-
-        Arguments
-        ---------
-        trip: transit_realtime.TripDescriptor
-            GTFS realtime TripDescriptor object (protobuf)
-
-        Returns
-        -------
-        str
-            service code of trip
-        """
-        start_date = trip.start_date
-        year, month, day = int(start_date[:4]), int(start_date[4:6]), \
-            int(start_date[6:])
-        day_of_week = date(year, month, day).isoweekday()
-
-        if day_of_week <= 5:
-            service_code = WEEKDAY_SERVICE_CODE
-        elif day_of_week == 6:
-            service_code = SAT_SERVICE_CODE
-        else:
-            service_code = SUN_SERVICE_CODE
-
-        return service_code
-
-    @staticmethod
-    def _get_all_prev_stops(schedule):
+    def _get_stops(schedule):
         """ Returns map of StopID -> Stop object for every possible
         StopID in the static transit data.
 
@@ -197,7 +359,7 @@ class PrevStops:
         dict[StopID -> Stop]
             Map of StopID -> Stop object
         """
-        all_prev_stops = {}
+        stops = {}
         trip_paths = set()
 
         for trip_object in schedule.GetTripList():
@@ -208,34 +370,69 @@ class PrevStops:
             # since a trip path uniquely defines a sequence of stops
             if trip_path not in trip_paths:
                 stop_times = trip_object.GetStopTimes()
-                for stop_time in stop_times:
+
+                for i in xrange(1, len(stop_times)):
+                    stop_time = stop_times[i]
                     stop_id = stop_time.stop.stop_id
                     stop_sequence = stop_time.stop_sequence
                     stop_id = StopID(route, stop_id)
 
-                    if stop_id not in all_prev_stops:
-                        all_prev_stops[stop_id] = Stop()
+                    # Subtract 2 because we need to access previous stop,
+                    # and stop_sequence is 1-indexed, rather than 0-indexed
+                    prev_stop = stop_times[stop_sequence - 2].stop.stop_id
 
-                    stop = all_prev_stops[stop_id]
+                    if stop_id not in stops:
+                        stops[stop_id] = Stop()
 
-                    # We ignore the case where the stop is at the beginning,
-                    # since clearly there is no previous stop
-                    if stop_sequence > 1:
-                        # Subtract 2 because we need to access previous stop,
-                        # and stop_sequence is 1-indexed, rather than 0-indexed
-                        prev_stop = stop_times[stop_sequence - 2].stop.stop_id
-                        stop.add_prev_stop(stop_sequence, prev_stop, trip_path)
+                    stop = stops[stop_id]
+                    stop.add_prev_stop(stop_sequence, prev_stop, trip_path)
 
                 trip_paths.add(trip_path)
 
-        return all_prev_stops
+        # Populate stops with trip times from previous stops
+        PrevStops._get_trip_times(stops, schedule)
+        return stops
 
     @staticmethod
-    def _get_ambiguous_trip_paths(all_prev_stops):
+    def _get_trip_times(stops, schedule):
+        """ Populates stops with trip times from preceding stops.
+
+        Arguments
+        ---------
+        stops: dict[StopID -> Stop]
+            Map of StopID -> Stop object
+        schedule: transitfeed.Schedule
+            Schedule object
+        """
+        for trip_object in schedule.GetTripList():
+            trip_id = trip_object.trip_id
+            route = trip_object.route_id
+            stop_times = trip_object.GetStopTimes()
+
+            for i in xrange(1, len(stop_times)):
+                stop_time = stop_times[i]
+                stop_sequence = stop_time.stop_sequence
+                prev_stop_time = stop_times[i - 1]
+                interval = stop_time.arrival_secs - \
+                    prev_stop_time.departure_secs
+
+                assert interval > 0
+
+                stop_id = StopID(route, stop_time.stop.stop_id)
+                stop = stops[stop_id]
+                prev_stop_id = prev_stop_time.stop.stop_id
+                stop.add_trip_time(stop_sequence, prev_stop_id, trip_id,
+                                   interval)
+
+        for stop in stops.values():
+            stop.sort_trip_times()
+
+    @staticmethod
+    def _get_ambiguous_trip_paths(stops):
         """ Returns map of trip path -> set of pairs of StopID + previous
         stops that are ambiguous and contained in that trip path; i.e. have
-        multiple trip paths that contain the info of that StopID and that
-        particular previous stop as the preceding stop.
+        multiple trip paths that contain the info of that StopID and
+        that particular previous stop as the preceding stop.
 
         To clarify, when we attempt to figure out from the live MTA feed what
         the stop a particular subway car is coming from, we're only guaranteed
@@ -247,16 +444,17 @@ class PrevStops:
         the time of day/day of week.
 
         This map will thus keep track of the trip paths that are a part of
-        these ambiguous cases; the values will be the set of pairs of StopIDs
-        and the previous possibility for that StopID that lies on that
-        particular trip path (we also store the previous stop to avoid an extra
-        call to generate the list of stops for that trip path), and the keys
-        are all such trip paths that do form an ambiguous scenario. This way,
-        we can work with all ambiguous cases in one pass of the trip list.
+        these ambiguous cases; the values will be the set of pairs of
+        StopIDs and the previous possibility for that
+        StopID that lies on that particular trip path (we also store
+        the previous stop to avoid an extra call to generate the list of stops
+        for that trip path), and the keys are all such trip paths that do form
+        an ambiguous scenario. This way, we can work with all ambiguous cases
+        in one pass of the trip list.
 
         Arguments
         ---------
-        all_prev_stops: dict[StopID -> Stop]
+        stops: dict[StopID -> Stop]
             Map of StopID -> Stop object
 
         Returns
@@ -268,7 +466,7 @@ class PrevStops:
         ambiguous_trip_paths = {}
 
         for stop_id, stop in \
-                all_prev_stops.iteritems():
+                stops.iteritems():
             # If there is more than one possible previous stop,
             # we have an ambiguous case
             if len(stop.prev_stops) > 1:
@@ -285,44 +483,46 @@ class PrevStops:
     @staticmethod
     def _get_ambiguous_stop_sequences(ambiguous_trip_paths, schedule):
         """ Returns map of StopID -> map of possible previous
-        stops for that particular StopID over all trips containing the
-        info of the StopID, keyed by service code and sorted by origin time
-        of the corresponding trip.
+        stops for that particular StopID over all trips containing
+        the info of the StopID, keyed by service code and sorted by
+        origin time of the corresponding trip.
 
-        This map is only used when there is ambiguity, and the StopID and stop
-        sequence are not enough to determine the previous stop.
+        This map is only used when there is ambiguity, and the StopID
+        and stop sequence are not enough to determine the previous stop.
 
         In these cases, an approximate solution is used. We store a list of the
         possible previous stop possibilities for every trip (including distinct
         origin times), and these lists are sorted by origin time. Then in order
-        to find the most likely previous stop given a particular StopID,
-        we simply find the corresponding previous stop (for a particular trip)
-        that has the origin time closest to the origin time of the live trip
-        and matching the same service code (i.e. weekday, Saturday, or Sunday).
+        to find the most likely previous stop given a particular
+        StopID, we simply find the corresponding previous stop (for a
+        particular trip) that has the origin time closest to the origin time of
+        the live trip and matching the same service code (i.e. weekday,
+        Saturday, or Sunday).
 
         Arguments
         ---------
         ambiguous_trip_paths: dict[str -> set[tuple[StopID, str]]]
-            Map of trip path -> set of pairs of StopID + previous stop
-            possibilities such that the trip path contains the info of the
-            StopID and the previous stop is the preceding stop of the StopID
-            on the trip path
+            Map of trip path -> set of pairs of StopID + previous
+            stop possibilities such that the trip path contains the info of the
+            StopID and the previous stop is the preceding stop of the
+            StopID on the trip path
         schedule: transitfeed.Schedule
             Schedule object
 
         Returns
         -------
         dict[StopID -> dict[str -> set[tuple[str, str]]]]
-            Map of StopID -> map of service code (i.e. WKD, SAT, SUN) ->
-            set of tuples of (origin time, previous stop)
+            Map of StopID -> map of service code (i.e. WKD, SAT, SUN)
+            -> set of tuples of (origin time, previous stop)
         """
         ambiguous_stop_sequences = {}
 
         # Populate pairs of origin times + corresponding previous stops for
         # each possible trip path for a given StopID + service code
         for trip_object in schedule.GetTripList():
-            service_code = trip_object.service_id[-3:]
-            origin_time, trip_path = trip_object.trip_id.split("_")[1:]
+            service_id, origin_time, trip_path = \
+                trip_object.trip_id.split("_")
+            service_code = service_id[-3:]
 
             if trip_path in ambiguous_trip_paths:
                 for stop_id, prev_stop in ambiguous_trip_paths[trip_path]:
@@ -346,7 +546,8 @@ class PrevStops:
 
             for service_code in prev_stops_by_service_code:
                 # Split sorted pairs into sorted lists of origin times and
-                # corresponding previous stop possibilities
+                # corresponding previous stop possibilities. We split because
+                # bisect can't operate on a key parameter
                 prev_stops = prev_stops_by_service_code[service_code]
                 sorted_origin_times, sorted_prev_stops = zip(*prev_stops)
                 prev_stops_by_service_code[service_code] = {
@@ -355,6 +556,52 @@ class PrevStops:
                 }
 
         return ambiguous_stop_sequences
+
+    def get_stop(self, vehicle):
+        """ Retrieves information about the stop that a vehicle is heading to.
+
+        Arguments
+        ---------
+        vehicle: transit_realtime.VehiclePosition
+            GTFS realtime VehiclePosition object (protobuf)
+
+        Returns
+        -------
+        tuple[StopID, Stop]
+            Pair of StopID / Stop objects corresponding to the stop
+            that a vehicle is heading towards
+        """
+        stop_id = StopID(
+            vehicle.trip.route_id,
+            vehicle.stop_id
+        )
+
+        if stop_id in self._stops:
+            return stop_id, self._stops[stop_id]
+        else:
+            # If the stop ID is not present, perhaps the car has switched
+            # to another route; see the comments for the ROUTE_GROUPS constant
+            # at the top. Unfortunately this isn't a perfect method, since it
+            # does not necessarily correctly determine what the actual route it
+            # switched to, but this information is not necessarily known just
+            # from the vehicle itself (one needs to look either at live trip
+            # updates on the feed or for live service alerts). Thus we simply
+            # find the first match.
+            for route in ROUTE_GROUP_MAPPING[vehicle.trip.route_id]:
+                stop_id = StopID(route, vehicle.stop_id)
+                if stop_id in self._stops:
+                    return stop_id, self._stops[stop_id]
+
+            # If a stop ID is still not found, we search all possible routes;
+            # this may happen in case of service changes due to maintenance
+            # or other problems in the subway. Unfortunately, similarly to
+            # above, this is not a perfect method, since we simply find the
+            # first match.
+            for route_group in ROUTE_GROUPS:
+                for route in route_group:
+                    stop_id = StopID(route, vehicle.stop_id)
+                    if stop_id in self._stops:
+                        return stop_id, self._stops[stop_id]
 
     def get_prev_stop(self, vehicle):
         """ Returns a possible previous stop for a given trip
@@ -371,52 +618,17 @@ class PrevStops:
             stop ID of possible previous stop
         """
         trip = vehicle.trip
-        route = trip.trip_id.split("_")[1].split(".")[0]
-        stop_id = StopID(
-            route,
-            vehicle.stop_id
-        )
         stop_sequence = vehicle.current_stop_sequence
-
-        if stop_id in self._all_prev_stops:
-            stop = self._all_prev_stops[stop_id]
-        # If the stop ID is not present, perhaps the car has switched
-        # to another route; see the comments for the ROUTE_GROUPS constant
-        # at the top. Unfortunately this isn't a perfect method, since it
-        # does not necessarily correctly determine what the actual route it
-        # switched to, but this information is not necessarily known just
-        # from the vehicle itself (one needs to look either at live trip
-        # updates on the feed or for live service alerts). Thus we simply
-        # find the first match and break.
-        else:
-            alternative_found = False
-            for route in ROUTE_GROUP_MAPPING[route]:
-                stop_id = StopID(route, vehicle.stop_id)
-                if stop_id in self._all_prev_stops:
-                    stop = self._all_prev_stops[stop_id]
-                    alternative_found = True
-                    break
-
-            # If a stop ID is still not found, we search all possible routes;
-            # this may happen in case of service changes due to maintenance
-            # or other problems in the subway. Unfortunately, similarly to
-            # above, this is not a perfect method, since we simply find the
-            # first match and break.
-            if not alternative_found:
-                for route_group in ROUTE_GROUPS:
-                    for route in route_group:
-                        stop_id = StopID(route, vehicle.stop_id)
-                        if stop_id in self._all_prev_stops:
-                            stop = self._all_prev_stops[stop_id]
-                            break
 
         # If vehicle is at the beginning of its trip, there is
         # obviously no previous stop
         if stop_sequence == 1:
             return None
+
+        stop_id, stop = self.get_stop(vehicle)
         # If there is only a unique previous stop among all trip
         # paths, simply return that stop
-        elif len(stop.prev_stops) == 1:
+        if len(stop.prev_stops) == 1:
             return next(iter(stop.prev_stops))
         else:
             # If there is a unique previous stop corresponding also
@@ -426,13 +638,19 @@ class PrevStops:
                 if len(prev_stops) == 1:
                     return next(iter(prev_stops))
 
-            # Otherwise, if the stop sequence number with the StopID
-            # does not guarantee a unique previous stop, or the stop
-            # sequence number does not match with a known number,
-            # attempt to guess a likely possibility by origin time
-            return self._get_prev_stop_by_origin_time(trip, stop_id)
+            # Otherwise, attempt a guess by origin time
+            return self._get_prev_stop_by_origin_time(stop_id, trip)
 
-    def _get_prev_stop_by_origin_time(self, trip, stop_id):
+    def get_prev_trip_time(self, prev_stop_id, vehicle):
+        if prev_stop_id is None:
+            return None
+        else:
+            stop = self.get_stop(vehicle)[1]
+            trip = vehicle.trip
+            stop_sequence = vehicle.current_stop_sequence
+            return stop.get_trip_time(prev_stop_id, trip, stop_sequence)
+
+    def _get_prev_stop_by_origin_time(self, stop_id, trip):
         """ Returns a possible previous stop for a given trip
         and stop that is closest in origin time.
 
@@ -448,7 +666,7 @@ class PrevStops:
         the given information (as there may be multiple trips
         on the same day and route starting at the same time),
         and currently there is no real tiebreaker method, other
-        than the rightmost tied element. That's mainly because
+        than the leftmost tied element. That's mainly because
         given that this method is only used in the last case,
         this means that given the route, stop, stop sequence,
         service code, and origin time (and even direction), it
@@ -459,29 +677,27 @@ class PrevStops:
         One can use future stops to match with possible trips
         or partial string matching in case an actual trip path ID
         is given at a certain point, but not entirely sure if the
-        effort is worth it; out of the few observations of the live
-        feed so far, this case isn't encountered.
-
-        TODO: Do testing/observations to see if this edge case
-        ever occurs
+        effort is worth it.
 
         Arguments
         ---------
-        trip: transit_realtime.TripDescriptor
-            GTFS realtime TripDescriptor object (protobuf)
         stop_id: StopID
             StopID object
+        trip: transit_realtime.TripDescriptor
+            GTFS realtime TripDescriptor object (protobuf)
 
         Returns
         -------
         str
             stop ID of possible previous stop
         """
-        service_code = PrevStops._get_service_code(trip)
+        service_code = get_service_code(trip)
+        origin_time = trip.trip_id.split("_")[0]
+
         sorted_prev_stop_pairs = \
             self._ambiguous_stop_sequences[stop_id][service_code]
-        origin_time = trip.trip_id.split("_")[0]
         sorted_origin_times = sorted_prev_stop_pairs["origin_times"]
+        sorted_prev_stops = sorted_prev_stop_pairs["prev_stops"]
 
         # We do this in case the origin time of the vehicle is later or
         # earlier than all stored origin times for a particular stop
@@ -498,12 +714,12 @@ class PrevStops:
 
         closest_index = min([
             (abs(int(origin_time) -
-                 int(sorted_prev_stop_pairs["origin_times"][candidate])),
+                 int(sorted_origin_times[candidate])),
                 candidate)
             for candidate in [left, right]
         ])[1]
 
-        return sorted_prev_stop_pairs["prev_stops"][closest_index]
+        return sorted_prev_stops[closest_index]
 
 
 class StopGraph:
@@ -514,6 +730,7 @@ class StopGraph:
     on a particular trip. This information is needed in order to render the
     frames of the path of the subway car.
     """
+
     def __init__(self, schedule):
         """ Constructor.
 
@@ -526,6 +743,32 @@ class StopGraph:
         stop_shapes = StopGraph._get_stop_shapes(schedule)
         self._edges = StopGraph._get_edges(schedule, stop_shapes,
                                            shape_indices)
+        self._parent_stations = StopGraph._get_parent_stations(schedule)
+
+    @staticmethod
+    def _get_parent_stations(schedule):
+        """ Returns mapping of stop IDs to corresponding parent stations.
+
+        Arguments
+        ---------
+        schedule: transitfeed.Schedule
+            Schedule object
+
+        Returns
+        -------
+        dict[str -> str]
+            Map of stop ID -> parent station
+        """
+        parent_stations = {}
+        for stop_object in schedule.GetStopList():
+            # We only store non-parent stations, since these will be the stop
+            # IDs in the feed
+            if stop_object.location_type != 1:
+                parent_station = stop_object.parent_station
+                stop_id = stop_object.stop_id
+                parent_stations[stop_id] = parent_station
+
+        return parent_stations
 
     @staticmethod
     def _get_stop_coords(stop_object):
@@ -636,8 +879,8 @@ class StopGraph:
     def _get_stop_edge(schedule, segment, stop_shapes, shape_indices):
         """ Return an edge of points between stops.
 
-        The Edge that is constructed contains a shape ID for a shape that
-        contains both the start and end stop, as well as the corresponding
+        The Edge that is constructed contains a shape ID for a shape
+        that contains both the start and end stop, as well as the corresponding
         indices of those stops in the sequence of points for that shape.
 
         Arguments
@@ -702,7 +945,8 @@ class StopGraph:
 
         Edges are mapped by the endpoints, with the following structure:
         {
-            Segment(start_station_id, end_station_id): Edge(
+            Segment(start_station_id, end_station_id):
+            Edge(
                 shape_id: shape ID containing start/end stops,
                 start_index: index of start stop in shape,
                 end_index: index of end stop in shape
@@ -722,8 +966,8 @@ class StopGraph:
         Returns
         -------
         dict[Segment[str, str] -> Edge(str, int, int)]
-            Map of Segment of start/stop stations -> Edge representing
-            sequence of points along Segment
+            Map of Segment of start/stop stations -> Edge
+            representing sequence of points along Segment
         """
         edges = {}
         for trip_object in schedule.GetTripList():
@@ -745,8 +989,9 @@ class StopGraph:
 
                 # If this edge (up to orientation) has not been seen before,
                 # add to map.
-                if Segment(start_station, end_station) not in edges and \
-                        Segment(end_station, start_station) not in edges:
+                if Segment(start_station, end_station) not in edges \
+                        and Segment(end_station, start_station) not \
+                        in edges:
                     edges[Segment(start_station, end_station)] = \
                         StopGraph._get_stop_edge(schedule,
                                                  Segment(start, end),
@@ -754,6 +999,10 @@ class StopGraph:
                                                  shape_indices)
 
         return edges
+
+    def get_parent_station(self, stop_id):
+        """ Retrieves parent station of a stop ID. """
+        return self._parent_stations[stop_id]
 
     def get_path(self, start, end, shapes):
         """ Returns sequence of points between two stops.
@@ -776,9 +1025,9 @@ class StopGraph:
         Arguments
         ---------
         start: str
-            Station ID of start stop (must be a parent station)
+            Stop ID of start stop
         end: str
-            Station ID of end stop (must be a parent station)
+            Stop ID of end stop
         shapes: dict[str -> dict[str -> list[[float, float]]]]
             Map of the form shape ID -> map of "points" -> list of coordinates
             in the form [lon, lat]
@@ -788,6 +1037,11 @@ class StopGraph:
         list[[float, float]]
             List of coordinates in the form [lon, lat]
         """
+        # Replace stop IDs with parent stations
+        start = self.get_parent_station(start)
+        end = self.get_parent_station(end)
+
+        # Deduce relative orientation of edge wrt to stored edge
         if Segment(start, end) in self._edges:
             edge = self._edges[Segment(start, end)]
             relative_orientation = 1
@@ -795,10 +1049,12 @@ class StopGraph:
             edge = self._edges[Segment(end, start)]
             relative_orientation = -1
 
+        # Deduce orientation of shape wrt stored edge
         shape_id = edge.shape_id
         start_index, end_index = sorted((edge.start_index,
                                         edge.end_index))
         shape_orientation = 1 if start_index == edge.start_index else -1
+
         points = shapes[shape_id]["points"]
 
         # Regular slice suffices

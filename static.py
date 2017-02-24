@@ -11,9 +11,9 @@ import transitfeed
 
 # TODO: Move this to a database, or make it more efficient in general
 
-JSON_DIR = "static/json/"
+JSON_DIR = "map_files/"
 PICKLE_DIR = ".cache/"
-STATIC_TRANSIT_DIR = "static_transit/"
+STATIC_TRANSIT_DIR = "transit_files/"
 
 if not os.path.isdir(JSON_DIR):
     os.makedirs(JSON_DIR)
@@ -54,6 +54,7 @@ ROUTE_GROUPS = [
     set(["J", "Z"]),
     set(["N", "Q", "R", "W"])
 ]
+
 ROUTE_GROUP_MAPPING = {
     route: route_group
     for route_group in ROUTE_GROUPS
@@ -895,8 +896,8 @@ def parse_stops(schedule):
                 stop_id = stop_object.stop_id
                 stop = stops[stop_id] = {}
 
-                coordinates = Coordinates(stop_object.stop_lon,
-                                          stop_object.stop_lat)
+                coordinates = Coordinates(stop_object.stop_lat,
+                                          stop_object.stop_lon)
                 if coordinates == NEW_SOUTH_FERRY:
                     coordinates = OLD_SOUTH_FERRY
 

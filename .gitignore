@@ -11,5 +11,7 @@ API_KEYS.py
 .ipynb_checkpoints
 .vagrant
 .vscode
-static_transit
-static/json
+transit_files
+!map_files/
+map_files/*
+!map_files/routes.json

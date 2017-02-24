@@ -10,7 +10,7 @@ from static import Edge, Segment, StopID, Stop, StopGraph, PrevStops  # noqa: F4
 
 import gtfs_realtime_pb2 as gtfs
 
-JSON_DIR = "static/json/"
+JSON_DIR = "map_files/"
 PICKLE_DIR = ".cache/"
 MTA_ENDPOINT = "http://datamine.mta.info/mta_esi.php?key={}&feed_id=1" \
     .format(mta_key)
@@ -26,61 +26,36 @@ with open(PICKLE_DIR + "graph.pkl", "rb") as graph_f, \
     graph = pickle.load(graph_f)
     prev_stops = pickle.load(prev_stops_f)
 
-# TODO: get nice way of retrieving remaining time until next stop
-demos = [
-    [
-        {
-            "path": [[-73.96411, 40.807722], [-73.958372, 40.815581]],
-            "progress": 0.5,
-            "remaining_time": 10
-        },
-        {
-            "path": graph.get_path("118S", "119S", shapes),
-            "progress": 0.3,
-            "remaining_time": 15
-        }
-    ],
-    [
-        {
-            "path": [[-73.96411, 40.807722], [-73.959874, 40.77362]],
-            "progress": 0.5,
-            "remaining_time": 10
-        },
-        {
-            "path": [[-73.958372, 40.815581], [-73.987691, 40.755477]],
-            "progress": 0.3,
-            "remaining_time": 25
-        },
-    ],
-    [
-        {
-            "path": [[-73.958372, 40.815581], [-73.987691, 40.755477]],
-            "progress": 0.3,
-            "remaining_time": 25
-        },
-        {
-            "path": [[-73.992629, 40.730328], [-73.989951, 40.734673]],
-            "progress": 0.3,
-            "remaining_time": 15
-        }
-    ]
-]
-
 
 class VehiclePosition:
-    def __init__(self, vehicle):
-        self.next_stop = vehicle.stop_id
-        self.prev_stop = prev_stops.get_prev_stop(vehicle)
-        self.prev_trip_time = prev_stops.get_prev_trip_time(self.prev_stop,
-                                                            vehicle)
-        if self.prev_stop is not None:
-            self.path = graph.get_path(self.prev_stop, self.next_stop, shapes)
+    def __init__(self, vehicle, trip_update):
+        next_stop = vehicle.stop_id
+        prev_stop = prev_stops.get_prev_stop(vehicle)
+        prev_trip_time = prev_stops.get_prev_trip_time(prev_stop,
+                                                       vehicle)
+        if prev_trip_time:
+            self.remaining_time = int(trip_update.arrival.time -
+                                      vehicle.timestamp)
+            self.progress = max(1 - float(self.remaining_time) / prev_trip_time, 0)
+        else:
+            self.remaining_time = 0
+            self.progress = 1
+
+        if prev_stop is not None:
+            self.path = graph.get_path(prev_stop, next_stop, shapes)
         else:
             # Vehicle is at beginning of its trip (sitting in its stop); thus,
             # we simply assume that the vehicle remains stationary until next
             # feed
-            station = graph.get_parent_station(self.next_stop)
+            station = graph.get_parent_station(next_stop)
             self.path = [stops[station]["coordinates"]]
+
+    def jsonify(self):
+        return {
+            "path": self.path,
+            "progress": self.progress,
+            "remaining_time": self.remaining_time
+        }
 
 
 def start_timer():
@@ -103,10 +78,24 @@ def get_feed():
 
 def get_vehicle_positions():
     feed = get_feed()
+    trip_updates = {}
+    vehicle_positions = []
     for entity in feed.entity:
-        pass
+        if entity.HasField("trip_update"):
+            trip_update = entity.trip_update
+            trip_id = trip_update.trip.trip_id
+            update = trip_update.stop_time_update[0]
+            trip_updates[trip_id] = update
 
-# testing API usage
-# for entity in feed.entity:
-#     if (entity.trip_update.trip.HasExtension(nyct.nyct_trip_descriptor)):
-#         print entity.trip_update.trip.Extensions[nyct.nyct_trip_descriptor]
+        elif entity.HasField("vehicle"):
+            vehicle = entity.vehicle
+            trip_id = vehicle.trip.trip_id
+            assert trip_id in trip_updates, entity
+            trip_update = trip_updates
+
+            # TODO: Take care of case where remaining_time < 30 seconds
+            position_json = VehiclePosition(vehicle, trip_update[trip_id]) \
+                .jsonify()
+            vehicle_positions.append(position_json)
+
+    return vehicle_positions

@@ -1,242 +1,273 @@
+"use strict";
 
-function log(msg) {
-  console.log(msg);
-}
+const SPEED = 60;
+const DURATION = 30;
+const TOTAL_FRAMERATE = SPEED * DURATION;
+const INTERVAL = 1000 / SPEED;
+const SAMPLE_POINTS = 20;
 
-function renderCars(map, subwayCars) {
-  const speed = 60;
-  const duration = 30;
-  const totalFrames = speed * duration;
-  const points = [];
-  const allAnimSteps = [];
-  $.each(subwayCars, (index, subwayCar) => {
+const DB_NAME = "LIVESUBWAY_DB";
+const DB_ROUTES_STORE = "ROUTES_STORE";
+const DB_STOPS_STORE = "STOPS_STORE";
+
+const LEAFLET_TYLE_LAYER = "http://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png";
+const LEAFLET_ATTRIBUTION = `&copy; <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy;` +
+  `<a href="http://cartodb.com/attributions">CartoDB</a>`;
+
+const LEAFLET_ZOOM = 13;
+const LEAFLET_MAX_ZOOM = 18;
+const LEAFLET_CENTER = [40.758896, -73.985130];
+const LEAFLET_MAP_BOUND = [
+  [40.440957, -74.380673],
+  [40.938094, -73.676237]
+];
+
+const SUBWAY_ICON = `<i class="fa fa-dot-circle-o" aria-hidden="true"></i>`;
+
+const MAPBOX = {
+  container: "subwaymap",
+  style: "mapbox://styles/mapbox/light-v9",
+  center: [-73.983393, 40.788552],
+  dragRotate: false,
+  zoom: 10.84,
+};
+
+const LAYER = {
+  id: "subwayCars",
+  type: "circle",
+  source: "subwayCars",
+  paint: {
+    "circle-radius": 4,
+    "circle-color": "#000000",
+  },
+};
+
+const animateTrains = (map, subwayCars) => {
+  const lineTuple = subwayCars.map(subwayCar => {
     const line = {
-      type: 'Feature',
+      type: "Feature",
       geometry: {
-        type: 'LineString',
+        type: "LineString",
         coordinates: subwayCar.path,
       },
     };
 
-    const distance = turf.lineDistance(line, 'miles');
+    const distance = turf.lineDistance(line, "miles");
     const distanceTraveled = subwayCar.progress * distance;
-    const remainingDistance = distance - distanceTraveled;
-    const animSteps = [];
-    const animSpeed = speed * subwayCar.remaining_time;
-    const animFrames = speed * Math.min(duration, subwayCar.remaining_time);
-    const point = turf.along(line, distanceTraveled, 'miles');
 
-    points.push(point);
+    return [line, distance, distanceTraveled, subwayCar.remaining_time];
+  });
 
-    for (let i = 0; i < animFrames; i += 1) {
-      const step = (i / animSpeed) * remainingDistance;
-      const segment = turf.along(line, distanceTraveled + step, 'miles');
-      animSteps.push(segment.geometry.coordinates);
-    }
+  const points = lineTuple.map(x => {
+    return turf.along(x[0], x[2], "miles");
+  });
 
-    if (animFrames < totalFrames) {
-      for (let i = animFrames; i < totalFrames; i += 1) {
-        const segment = turf.along(line, distance, 'miles');
-        animSteps.push(segment.geometry.coordinates);
-      }
-    }
+  const allAnimSteps = lineTuple.map(x => {
+    const [line, d, dT, rT] = x;
+    const remainingDistance = d - dT;
+    const animSpeed = SPEED * rT;
+    const animFrames = SPEED * Math.min(DURATION, rT);
 
-    allAnimSteps.push(animSteps);
+    return [...Array(TOTAL_FRAMERATE).keys()].map((x, i) => {
+      const distance = i < animFrames ? dT + (i / animSpeed) * remainingDistance : d;
+
+      const segment = turf.along(line, distance, "miles");
+
+      return segment.geometry.coordinates;
+    });
   });
 
   const source = {
-    type: 'geojson',
+    type: "geojson",
     data: {
-      type: 'FeatureCollection',
+      type: "FeatureCollection",
       features: points,
     },
   };
 
-  if (map.getSource('subwayCars') === undefined) {
-    map.addSource('subwayCars', source);
-  } else {
-    map.getSource('subwayCars').setData(source.data);
-  }
+  // const start = Date.now();
 
-  if (map.getLayer('subwayCars') === undefined) {
-    map.addLayer({
-      id: 'subwayCars',
-      type: 'circle',
-      source: 'subwayCars',
-      paint: {
-        'circle-radius': 4,
-        'circle-color': '#000000',
-      },
-    });
-  }
+  // let then = start;
+  // let counter = 0;
 
-  const interval = 1000 / speed;
-  const start = Date.now();
-  let then = start;
-  let counter = 0;
+  // const animate = () => {
+  //   if (counter / INTERVAL < (SPEED * DURATION) - 1) {
+  //     const now = Date.now();
+  //     const elapsed = now - then;
 
-  function animate() {
-    if (counter / interval < (speed * duration) - 1) {
-      requestAnimationFrame(animate);
+  //     then = now;
 
-      const now = Date.now();
-      const elapsed = now - then;
-      then = now;
+  //     points.forEach((point, i) => {
+  //       const animSteps = allAnimSteps[i];
 
-      for (let i = 0; i < points.length; i += 1) {
-        const point = points[i];
-        const animSteps = allAnimSteps[i];
-        point.geometry.coordinates = animSteps[Math.round(counter / interval)];
+  //       point.geometry.coordinates = animSteps[Math.round(elapsed / INTERVAL)];
+  //     });
+
+  //     map.getSource("subwayCars").setData({
+  //       type: "FeatureCollection",
+  //       features: points,
+  //     });
+
+  //     counter += elapsed;
+
+  //     requestAnimationFrame(animate);
+  //   } else {
+  //     const animTime = ((Date.now() - start) / 1000).toString();
+
+  //     console.log(`Time elapsed for animation: ${animTime}`);
+  //   }
+  // };
+
+  // animate();
+};
+
+const getJSON = (path, success, fail) => {
+  const xmlhttp = new XMLHttpRequest();
+
+  xmlhttp.onreadystatechange = () => {
+    if (xmlhttp.readyState === XMLHttpRequest.DONE) {
+      if (xmlhttp.status === 200) {
+        success(JSON.parse(xmlhttp.responseText));
+      } else {
+        fail();
       }
-
-      map.getSource('subwayCars').setData({
-        type: 'FeatureCollection',
-        features: points,
-      });
-
-      counter += elapsed;
-    } else {
-      const end = Date.now();
-      const animTime = ((end - start) / 1000).toString();
-      log(`Time elapsed for animation: ${animTime}`);
     }
-  }
+  };
 
-  animate();
-}
+  xmlhttp.open("GET", path, true);
+  xmlhttp.send();
+};
 
-$(document).ready(() => {
-  mapboxgl.accessToken = ACCESSTOKEN;
-  const map = new mapboxgl.Map({
-    container: 'subwaymap',
-    style: 'mapbox://styles/mapbox/light-v9',
-    center: [-73.983393, 40.788552],
-    dragRotate: false,
-    zoom: 10.84,
+const fetchMap = (fetcher, map, routes, finish) => {
+  const renderRoutes = (routesData, cb) => {
+    const linesLayer = new L.geoJson(routesData).addTo(map);
+
+    linesLayer.setStyle((feature) => {
+      return {
+        "weight": 3,
+        "opacity": 1,
+        "color": SUBWAY_COLORS[feature.properties.route_id]
+      };
+    });
+
+    cb();
+  };
+
+  const routePromise = new Promise((resolve, reject) => {
+    fetcher("/map_geojson", (stopData) => {
+      renderRoutes(stopData, resolve);
+    }, reject);
   });
 
-  map.on('load', () => {
-    const socket = io.connect('localhost:5000');
+  const renderStops = (stopData, cb) => {
+    const stops = Object.entries(stopData).filter(([_, stopVal]) => {
+      return stopVal.name.toLowerCase().indexOf("2 av") === -1;
+    }).map(([_, stopVal]) => stopVal);
 
-    const routeIDsList = [
-      'route-1..N03R',
-      'route-5..S03R',
-      'route-A..N04R',
-      'route-N..N20R',
-      'route-D..N05R',
-      'route-B..N46R',
-    ];
+    const stopNames = stops.map(stopVal => stopVal.name);
 
-    $.when((
-      $.getJSON('/map_json', (mapData) => {
-        /**
-         * This is used because we have a second loop
-         * that only adds layers for the chosen routes:
-         * we're only displaying a few for performance reasons
-         * until we can optimize the rendering.
-         */
-        const tempColorMap = {};
-
-        $.each(mapData, (mapKey, mapVal) => {
-          const routeID = 'route-'.concat(mapKey);
-          tempColorMap[routeID] = mapVal.color;
-
-          map.addSource(routeID, {
-            type: 'geojson',
-            data: {
-              type: 'Feature',
-              properties: {
-                color: mapVal.color,
-              },
-              geometry: {
-                type: 'LineString',
-                coordinates: mapVal.points,
-              },
-            },
-          });
-        });
-
-        $.each(routeIDsList, (index, key) => {
-          map.addLayer({
-            id: key,
-            type: 'line',
-            source: key,
-            layout: {
-              'line-join': 'round',
-              'line-cap': 'round',
-            },
-            paint: {
-              'line-color': tempColorMap[key],
-              'line-width': 3,
-            },
-          });
-        });
-
-        $.getJSON('/stops_json', (stopData) => {
-          const stopsFeatureData = $.map(stopData, (stopVal) => {
-            const name = stopVal.name;
-            const coordinates = stopVal.coordinates.join(', ');
-            const descriptionHTML = `<strong>${name}</strong><br><p>${coordinates}</p>`;
-            const stopSource = {
-              type: 'Feature',
-              properties: {
-                description: descriptionHTML,
-              },
-              geometry: {
-                type: 'Point',
-                coordinates: stopVal.coordinates,
-              },
-            };
-
-            return stopSource;
-          });
-
-          map.addSource('stops', {
-            type: 'geojson',
-            data: {
-              type: 'FeatureCollection',
-              features: stopsFeatureData,
-            },
-          });
-
-          map.addLayer({
-            id: 'stops',
-            type: 'circle',
-            source: 'stops',
-            paint: {
-              'circle-radius': {
-                stops: [[11, 3], [14, 4], [16, 5]],
-              },
-              'circle-color': '#ff3300',
-            },
-          });
-        });
-      })
-    )).then(() => {
-      socket.on('feed', (subwayCars) => {
-        renderCars(map, subwayCars);
+    const subwayMarkers = stops.map(stopVal => {
+      const stopMarker = L.divIcon({
+        html: SUBWAY_ICON
       });
-    }).then(() => {
-      socket.emit('get_feed');
+
+      return L.marker(stopVal.coordinates, {
+        icon: stopMarker
+      });
     });
 
-    const popup = new mapboxgl.Popup({
-      closeButton: false,
-      closeOnClick: false,
+    L.layerGroup(subwayMarkers).addTo(map);
+
+    subwayMarkers.forEach((marker, index) => {
+      marker.bindPopup(`<strong>${stopNames[index]}</strong>`);
+      marker.on("mouseover", e => {
+        marker.openPopup();
+      });
     });
 
-    map.on('mousemove', (e) => {
-      const features = map.queryRenderedFeatures(e.point, { layers: ['stops'] });
-      map.getCanvas().style.cursor = (features.length) ? 'pointer' : '';
-      if (!features.length) {
-        popup.remove();
-        return;
-      }
+    cb();
+  };
 
-      const feature = features[0];
-      popup.setLngLat(feature.geometry.coordinates)
-          .setHTML(feature.properties.description)
-          .addTo(map);
+  const stopPromise = new Promise((resolve, reject) => {
+    fetcher("/stops_json", (stopData) => {
+      renderStops(stopData, resolve);
+    }, reject);
+  });
+
+  Promise.all([routePromise, stopPromise])
+    .then(() => {
+      finish();
+    }).catch(() => {});
+};
+
+class MapDB {
+  constructor() {
+    const storesPath = [DB_ROUTES_STORE, DB_STOPS_STORE];
+
+    const openRequest = indexedDB.open(DB_NAME, 1);
+
+    openRequest.onupgradeneeded = function(e) {
+      console.log("Upgrading...");
+
+      const db = e.target.result;
+
+      storesPath.filter(x => db.objectStoreNames.contains(x)).forEach(x => {
+        db.createObjectStore(DB_ROUTES_STORE);
+      });
+    };
+
+    openRequest.onsuccess = (e) => {
+      console.log("Success!");
+
+      this.db = e.target.result;
+    };
+
+    openRequest.onerror = (e) => {
+      console.log("Error");
+      console.dir(e);
+    };
+  }
+
+  addRoutes(routes) {
+
+  }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  const map = L.map("subwaymap").setView(LEAFLET_CENTER, LEAFLET_ZOOM);
+
+  map.options.minZoom = LEAFLET_ZOOM - 1;
+  map.options.maxZoom = LEAFLET_MAX_ZOOM;
+
+  L.tileLayer(LEAFLET_TYLE_LAYER, {
+    attribution: LEAFLET_ATTRIBUTION,
+    minZoom: LEAFLET_ZOOM - 1,
+    maxZoom: LEAFLET_MAX_ZOOM
+  }).addTo(map);
+
+  const bounds = L.latLngBounds(LEAFLET_MAP_BOUND);
+
+  map.on("drag", () => {
+    map.panInsideBounds(bounds, {
+      animate: false
     });
+  });
+
+  const indexedDB = window.indexedDB || window.mozIndexedDB || window.webkitIndexedDB || window.msIndexedDB;
+
+  const socket = io.connect("localhost:5000");
+
+  // if (!indexedDB) {
+  fetchMap(getJSON, map, SUBWAY_ROUTES, () => {
+    socket.emit("get_feed");
+  });
+  // } else {
+  //   new MapDB();
+  // }
+
+  socket.emit("get_feed");
+
+  socket.on("feed", subwayCars => {
+    animateTrains(map, subwayCars);
   });
 });

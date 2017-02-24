@@ -5,7 +5,7 @@ from flask import Flask, json, jsonify, render_template
 from flask_socketio import SocketIO, emit
 
 from API_KEYS import mapbox_key
-from static import Edge, PrevStops, Segment, Stop, StopGraph, StopID  # noqa: F401
+from static import Edge, PrevStops, Segment, Stop, StopGraph, StopID# noqa: F401
 
 import feed
 
@@ -72,7 +72,9 @@ demos = [
 
 @app.route('/')
 def index():
-    return render_template("index.html", mapbox_key=mapbox_key, subway_routes=shapes.keys(), route_colors=colors)
+    return render_template("index.html", mapbox_key=mapbox_key,
+                                    subway_routes=shapes.keys(),
+                                    route_colors=colors)
 
 
 @app.route('/map_json/<route>')
